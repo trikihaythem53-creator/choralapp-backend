@@ -13,8 +13,20 @@ import { detectLanguage, qualityScore } from '../utils/textCleaner.js';
 const execAsync = promisify(exec);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const TMP_DIR   = path.join(__dirname, '../../tmp');
+const COOKIES_PATH = path.join(TMP_DIR, 'youtube_cookies.txt');
 
 if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
+
+// Écrire les cookies YouTube depuis la variable d'environnement (si fournie)
+// YOUTUBE_COOKIES doit contenir le contenu complet du fichier cookies.txt exporté
+if (process.env.YOUTUBE_COOKIES) {
+  try {
+    fs.writeFileSync(COOKIES_PATH, process.env.YOUTUBE_COOKIES);
+    logger.info('Cookies YouTube chargés depuis YOUTUBE_COOKIES');
+  } catch (e) {
+    logger.warn('Impossible d\'écrire les cookies YouTube:', e.message);
+  }
+}
 
 // Initialiser OpenAI avec la clé directement
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
@@ -52,26 +64,36 @@ export async function transcribeYouTube(youtubeUrl) {
   } catch (err) {
     cleanup(outPath);
     logger.error('Erreur YouTube:', err.message);
+
+    // Message clair si le problème vient des cookies expirés/manquants
+    if (err.message.includes('Sign in to confirm') || err.message.includes('bot')) {
+      throw new Error('⚠️ Les cookies YouTube ont expiré — l\'admin technique doit les renouveler (voir /diagnose/youtube-cookies)');
+    }
     throw new Error(err.message);
   }
 }
 
 async function downloadWithYtDlp(url, outputPath) {
+  const hasCookies = fs.existsSync(COOKIES_PATH);
+  const cookiesArg = hasCookies ? `--cookies "${COOKIES_PATH}"` : '';
+
   // Client "android" contourne souvent la détection bot de YouTube
   // --js-runtimes deno active le runtime JS requis par les nouvelles protections YouTube
   const cmd = `yt-dlp -x --audio-format mp3 --audio-quality 5 --no-playlist ` +
+    `${cookiesArg} ` +
     `--extractor-args "youtube:player_client=android,web" ` +
     `--js-runtimes deno ` +
     `--user-agent "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36" ` +
     `-o "${outputPath}" "${url}"`;
-  logger.info(`Commande yt-dlp...`);
+  logger.info(`Commande yt-dlp... (cookies: ${hasCookies ? 'oui' : 'non'})`);
   try {
     const { stdout, stderr } = await execAsync(cmd, { timeout: 120000 });
     if (stderr) logger.warn('yt-dlp stderr:', stderr.slice(0, 500));
   } catch (err) {
-    // Fallback : réessayer avec le client web simple si android échoue
+    // Fallback : réessayer avec le client web simple + cookies si disponibles
     logger.warn('Échec avec client android, nouvelle tentative avec client web...');
     const fallbackCmd = `yt-dlp -x --audio-format mp3 --audio-quality 5 --no-playlist ` +
+      `${cookiesArg} ` +
       `--js-runtimes deno ` +
       `-o "${outputPath}" "${url}"`;
     try {
