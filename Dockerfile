@@ -38,6 +38,9 @@ RUN curl -fsSL https://deno.land/install.sh | sh
 ENV DENO_INSTALL="/root/.deno"
 ENV PATH="$DENO_INSTALL/bin:$PATH"
 
+# Précharger le composant de résolution de challenge JS (ejs) pour éviter de le télécharger à chaque requête
+RUN yt-dlp --remote-components ejs:github --js-runtimes deno --skip-download "https://www.youtube.com/watch?v=jNQXAC9IVRw" || true
+
 WORKDIR /app
 
 COPY package*.json ./
