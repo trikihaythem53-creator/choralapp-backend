@@ -57,12 +57,28 @@ export async function transcribeYouTube(youtubeUrl) {
 }
 
 async function downloadWithYtDlp(url, outputPath) {
-  const cmd = `yt-dlp -x --audio-format mp3 --audio-quality 5 --no-playlist -o "${outputPath}" "${url}"`;
+  // Client "android" contourne souvent la détection bot de YouTube
+  // --js-runtimes deno active le runtime JS requis par les nouvelles protections YouTube
+  const cmd = `yt-dlp -x --audio-format mp3 --audio-quality 5 --no-playlist ` +
+    `--extractor-args "youtube:player_client=android,web" ` +
+    `--js-runtimes deno ` +
+    `--user-agent "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36" ` +
+    `-o "${outputPath}" "${url}"`;
   logger.info(`Commande yt-dlp...`);
   try {
-    await execAsync(cmd, { timeout: 120000 });
+    const { stdout, stderr } = await execAsync(cmd, { timeout: 120000 });
+    if (stderr) logger.warn('yt-dlp stderr:', stderr.slice(0, 500));
   } catch (err) {
-    throw new Error(`yt-dlp échoué: ${err.message}`);
+    // Fallback : réessayer avec le client web simple si android échoue
+    logger.warn('Échec avec client android, nouvelle tentative avec client web...');
+    const fallbackCmd = `yt-dlp -x --audio-format mp3 --audio-quality 5 --no-playlist ` +
+      `--js-runtimes deno ` +
+      `-o "${outputPath}" "${url}"`;
+    try {
+      await execAsync(fallbackCmd, { timeout: 120000 });
+    } catch (err2) {
+      throw new Error(`yt-dlp échoué: ${err2.message}`);
+    }
   }
 }
 
