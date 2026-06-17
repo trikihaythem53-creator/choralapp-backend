@@ -8,7 +8,6 @@ export const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY,
   {
     auth: { autoRefreshToken: false, persistSession: false },
-    realtime: { params: { eventsPerSecond: 1 } },
-    global: { WebSocket: ws },
+    realtime: { transport: ws },
   }
 );
