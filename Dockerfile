@@ -6,6 +6,8 @@ RUN apt-get update && apt-get install -y \
     python3 \
     python3-pip \
     wget \
+    curl \
+    unzip \
     gnupg \
     ca-certificates \
     fonts-liberation \
@@ -30,6 +32,11 @@ RUN apt-get update && apt-get install -y \
 
 # Installer yt-dlp via pip (toujours à jour)
 RUN pip3 install --break-system-packages -U yt-dlp
+
+# Installer Deno (runtime JS requis par yt-dlp pour contourner les protections YouTube)
+RUN curl -fsSL https://deno.land/install.sh | sh
+ENV DENO_INSTALL="/root/.deno"
+ENV PATH="$DENO_INSTALL/bin:$PATH"
 
 WORKDIR /app
 
