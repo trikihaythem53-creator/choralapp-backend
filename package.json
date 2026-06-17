@@ -12,6 +12,7 @@
     "cors": "^2.8.5",
     "dotenv": "^16.4.1",
     "@supabase/supabase-js": "^2.39.0",
+    "ws": "^8.16.0",
     "axios": "^1.6.7",
     "cheerio": "^1.0.0-rc.12",
     "puppeteer": "^21.9.0",
