@@ -83,6 +83,7 @@ async function downloadWithYtDlp(url, outputPath) {
     `${cookiesArg} ` +
     `--extractor-args "youtube:player_client=android,web" ` +
     `--js-runtimes deno ` +
+    `--remote-components ejs:github ` +
     `--user-agent "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36" ` +
     `-o "${outputPath}" "${url}"`;
   logger.info(`Commande yt-dlp... (cookies: ${hasCookies ? 'oui' : 'non'})`);
@@ -95,6 +96,7 @@ async function downloadWithYtDlp(url, outputPath) {
     const fallbackCmd = `yt-dlp -x --audio-format mp3 --audio-quality 5 --no-playlist ` +
       `${cookiesArg} ` +
       `--js-runtimes deno ` +
+      `--remote-components ejs:github ` +
       `-o "${outputPath}" "${url}"`;
     try {
       await execAsync(fallbackCmd, { timeout: 120000 });
