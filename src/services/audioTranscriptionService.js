@@ -64,11 +64,6 @@ export async function transcribeYouTube(youtubeUrl) {
   } catch (err) {
     cleanup(outPath);
     logger.error('Erreur YouTube:', err.message);
-
-    // Message clair si le problème vient des cookies expirés/manquants
-    if (err.message.includes('Sign in to confirm') || err.message.includes('bot')) {
-      throw new Error('⚠️ Les cookies YouTube ont expiré — l\'admin technique doit les renouveler (voir /diagnose/youtube-cookies)');
-    }
     throw new Error(err.message);
   }
 }
