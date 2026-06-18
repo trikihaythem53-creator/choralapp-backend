@@ -1,45 +1,72 @@
 // src/services/lyricsService.js
+// Stratégie : aghanilyrics.com (confirmé fonctionnel depuis Render) + cache Supabase
 import 'dotenv/config';
 import axios from 'axios';
 import * as cheerio from 'cheerio';
+import { supabase } from '../utils/supabase.js';
 import { cleanLyrics, detectLanguage, qualityScore, formatLyricsWithSections } from '../utils/textCleaner.js';
 import { logger } from '../utils/logger.js';
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+const GENIUS_TOKEN = process.env.GENIUS_TOKEN || "flW2DO1G8O3iu_ioi0-iuIgvpnIS-vFVdYy4xUGJt-uNIwFSxx00j6zpwF0oYj3c";
+const HAPPI_KEY   = "hk1165-4Ql3s2bNtIM8v3IKHopnnFdVLUTusnsxLw";
 
-async function httpGet(url) {
-  const cfg = { timeout: 15000, headers: { 'User-Agent': UA, 'Accept-Language': 'ar,fr;q=0.9,en;q=0.8' } };
-  try {
-    return await axios.get(url, cfg);
-  } catch (e) {
-    if (/EPROTO|SSL|unsupported protocol|legacy sigalg/i.test(e.message || '')) {
-      const https = await import('node:https');
-      return await axios.get(url, { ...cfg, httpsAgent: new https.Agent({ minVersion: 'TLSv1', rejectUnauthorized: false }) });
+// ── HTTP avec retry automatique et repli TLS ─────────────────────────────
+async function httpGet(url, retries = 2) {
+  const cfg = {
+    timeout: 15000,
+    headers: {
+      'User-Agent': UA,
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'ar,fr;q=0.9,en;q=0.8',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'Connection': 'keep-alive',
+    },
+  };
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await axios.get(url, cfg);
+    } catch (e) {
+      // Repli TLS pour sites avec certificats anciens
+      if (/EPROTO|SSL|legacy sigalg/i.test(e.message || '')) {
+        const https = await import('node:https');
+        return await axios.get(url, { ...cfg, httpsAgent: new https.Agent({ minVersion: 'TLSv1', rejectUnauthorized: false }) });
+      }
+      // Retry sur timeout ou 5xx
+      if (attempt < retries && (e.code === 'ECONNABORTED' || (e.response?.status >= 500))) {
+        await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+        continue;
+      }
+      throw e;
     }
-    throw e;
   }
 }
 
+// ── Normalisation arabe poussée ──────────────────────────────────────────
 function norm(s = '') {
   return s.toLowerCase().trim()
     .normalize('NFKD')
-    .replace(/[\u064B-\u065F\u0670]/g, '')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[أإآا]/g, 'ا')
-    .replace(/[ىي]/g, 'ي')
-    .replace(/ة/g, 'ه')
+    .replace(/[\u064B-\u065F\u0670]/g, '') // tachkil
+    .replace(/[\u0300-\u036f]/g, '')        // accents latins
+    .replace(/[أإآا]/g, 'ا')               // alef
+    .replace(/[ىي]/g, 'ي')                  // ya
+    .replace(/ة/g, 'ه')                     // ta marbuta
     .replace(/\s+/g, ' ');
+}
+
+function isArabic(text = '') {
+  return /[\u0600-\u06FF]/.test(text);
 }
 
 function similarity(a, b) {
   if (!a || !b) return 0;
   if (a === b) return 1;
   if (b.includes(a) || a.includes(b)) return 0.9;
-  const wordsA = new Set(a.split(/\s+/).filter(w => w.length > 1));
-  const wordsB = new Set(b.split(/\s+/).filter(w => w.length > 1));
+  const wA = new Set(a.split(/\s+/).filter(w => w.length > 1));
+  const wB = new Set(b.split(/\s+/).filter(w => w.length > 1));
   let common = 0;
-  wordsA.forEach(w => { if (wordsB.has(w)) common++; });
-  return common / Math.max(wordsA.size, wordsB.size, 1);
+  wA.forEach(w => { if (wB.has(w)) common++; });
+  return common / Math.max(wA.size, wB.size, 1);
 }
 
 function toSlug(s = '') {
@@ -49,52 +76,110 @@ function toSlug(s = '') {
     .replace(/^-+|-+$/g, '');
 }
 
-// ── Table artistes arabes → slug aghanilyrics.com ────────────────────────
+// ── Extraction paroles depuis une page HTML ──────────────────────────────
+function extractLyrics($) {
+  // Supprimer bruit
+  $('script, style, nav, header, footer, iframe, .adsbygoogle, .sharedaddy, .jp-relatedposts, [class*="ad-"], [id*="ad-"]').remove();
+
+  // Sélecteurs dans l'ordre de priorité
+  const selectors = ['.entry-content', 'article .post-content', '.post-content', 'article', '.lyric', '.lyrics', '#lyric-body-text', '[class*="lyric"]'];
+  for (const sel of selectors) {
+    const el = $(sel).first();
+    if (!el.length) continue;
+    el.find('h1, h2, h3, script, style').remove();
+    el.find('br').replaceWith('\n');
+    const text = el.text().replace(/\n{3,}/g, '\n\n').trim();
+    if (isQuality(text)) return text;
+  }
+
+  // Fallback : plus grand bloc de texte arabe
+  let best = '';
+  $('div, p, section').each((_, el) => {
+    const text = $(el).text().trim();
+    if (text.length > best.length && text.length < 12000 && isQuality(text)) best = text;
+  });
+  return best || null;
+}
+
+// ── Filtrage qualité ─────────────────────────────────────────────────────
+function isQuality(text = '') {
+  if (text.length < 100) return false;
+  if (/advertisement|subscribe now|sign up|cookie/i.test(text)) return false;
+  if (/[\u0600-\u06FF]/.test(text)) {
+    const arabicRatio = (text.match(/[\u0600-\u06FF]/g) || []).length / Math.max(text.replace(/\s/g, '').length, 1);
+    return arabicRatio > 0.2;
+  }
+  return true;
+}
+
+// ── Table de translittération artistes ──────────────────────────────────
 const ARAB_ARTISTS = {
-  // Égyptiens
-  'محمد فؤاد': 'mohammad-fouad', 'عمرو دياب': 'amr-diab', 'تامر حسني': 'tamer-hosny',
-  'نانسي عجرم': 'nancy-ajram', 'هاني شاكر': 'hani-shaker', 'محمد منير': 'mohammed-mounir',
-  'وائل كفوري': 'wael-kfoury', 'أم كلثوم': 'om-kalthoum', 'عبد الحليم حافظ': 'abdel-halim-hafez',
-  // Khalijis
-  'كاظم الساهر': 'kazem-al-saher', 'ماجد المهندس': 'majid-al-mohandis',
-  'راشد الماجد': 'rashed-al-majed', 'حسين الجسمي': 'hussain-al-jasmi', 'محمد عبده': 'mohammed-abdo',
-  // Syriens/Libanais
-  'فيروز': 'fairuz', 'ميادة الحناوي': 'mayada-el-hennawy', 'صباح فخري': 'sabah-fakhri',
-  'وردة الجزائرية': 'warda', 'سميرة سعيد': 'samira-said',
-  // Tunisiens
-  'بلطي': 'balti', 'صابر الرباعي': 'saber-rebai', 'لطفي بوشناق': 'lotfi-bouchnak',
-  'لطيفة': 'latifa', 'لطيفة العرفاوي': 'latifa', 'آمال المثلوثي': 'emel-mathlouthi',
-  'نوردو': 'nordo', 'علاء': 'ala', 'كافون': 'kafon', 'أماني السويسي': 'amani-swissi',
-  'هند صبري': 'hend-sabry', 'زازا': 'zaza', 'جي جي آ': 'gga', 'الصادق ثريا': 'sadek-thraya',
-  // Algériens
-  'الشاب خالد': 'cheb-khaled', 'الشاب مامي': 'cheb-mami', 'سولكينغ': 'soolking',
-  'الشابة الزهوانية': 'cheba-zahouania',
-  // Marocains
-  'سعد لمجرد': 'saad-lamjarred', 'حاتم عمور': 'hatim-ammor', 'أسماء لمنور': 'asma-lmnawar',
-  'منال': 'manal', 'مسلم': 'muslim', 'دوزي': 'douzi',
-  // Libyens
-  'أيمن الأعتر': 'ayman-alatar', 'أحمد فكرون': 'ahmed-fakroun', 'محمد حسن': 'mohamed-hassan',
-  // Autres
-  'سامي يوسف': 'sami-yusuf',
+  'محمد فؤاد':'mohammad-fouad','عمرو دياب':'amr-diab','تامر حسني':'tamer-hosny',
+  'نانسي عجرم':'nancy-ajram','هاني شاكر':'hani-shaker','محمد منير':'mohammed-mounir',
+  'وائل كفوري':'wael-kfoury','أم كلثوم':'om-kalthoum','عبد الحليم حافظ':'abdel-halim-hafez',
+  'كاظم الساهر':'kazem-al-saher','ماجد المهندس':'majid-al-mohandis',
+  'راشد الماجد':'rashed-al-majed','حسين الجسمي':'hussain-al-jasmi','محمد عبده':'mohammed-abdo',
+  'فيروز':'fairuz','ميادة الحناوي':'mayada-el-hennawy','صباح فخري':'sabah-fakhri',
+  'وردة الجزائرية':'warda','سميرة سعيد':'samira-said',
+  'بلطي':'balti','صابر الرباعي':'saber-rebai','لطفي بوشناق':'lotfi-bouchnak',
+  'لطيفة':'latifa','لطيفة العرفاوي':'latifa','آمال المثلوثي':'emel-mathlouthi',
+  'نوردو':'nordo','علاء':'ala','كافون':'kafon','أماني السويسي':'amani-swissi',
+  'هند صبري':'hend-sabry','زازا':'zaza','جي جي آ':'gga','الصادق ثريا':'sadek-thraya',
+  'الشاب خالد':'cheb-khaled','الشاب مامي':'cheb-mami','سولكينغ':'soolking',
+  'الشابة الزهوانية':'cheba-zahouania',
+  'سعد لمجرد':'saad-lamjarred','حاتم عمور':'hatim-ammor','أسماء لمنور':'asma-lmnawar',
+  'منال':'manal','مسلم':'muslim','دوزي':'douzi',
+  'أيمن الأعتر':'ayman-alatar','أحمد فكرون':'ahmed-fakroun','محمد حسن':'mohamed-hassan',
+  'سامي يوسف':'sami-yusuf',
 };
 
 // ══════════════════════════════════════════════════════════════
-// PIPELINE — aghanilyrics.com uniquement (stratégie URL directe)
+// PIPELINE PRINCIPAL
 // ══════════════════════════════════════════════════════════════
 export async function importLyricsPipeline(title, artist) {
   logger.info(`Pipeline: "${title}" / "${artist}"`);
   const trace = [];
 
+  // ── ÉTAPE 1 : Cache Supabase ─────────────────────────────────
+  try {
+    const cacheKey = `${norm(title)}|${norm(artist)}`;
+    const { data: cached } = await supabase
+      .from('lyrics_imports')
+      .select('*')
+      .eq('cache_key', cacheKey)
+      .eq('status', 'completed')
+      .single();
+
+    if (cached?.lyrics) {
+      logger.info(`✅ Cache Supabase hit: "${title}"`);
+      trace.push({ step: 'cache', status: 'found' });
+      return { lyrics: cached.lyrics, lang: cached.lang, source: 'cache', provider: 'Cache Supabase', score: 1, trace };
+    }
+  } catch {}
+
+  // ── ÉTAPE 2 : aghanilyrics.com (confirmé fonctionnel depuis Render) ──
   try {
     logger.info('→ aghanilyrics.com…');
-    const result = await tryAghaniLyrics(title, artist);
-    if (result?.lyrics && result.lyrics.length > 30) {
+    const result = await scrapeAghaniLyrics(title, artist);
+    if (result?.lyrics) {
       const cleaned = cleanLyrics(result.lyrics);
-      if (cleaned && cleaned.length > 30) {
+      if (cleaned && cleaned.length > 100) {
         const lang  = detectLanguage(cleaned);
         const score = qualityScore(cleaned, 'scraping');
-        logger.info(`✅ Trouvé — ${result.provider}`);
         trace.push({ step: 'aghanilyrics', status: 'found', provider: result.provider });
+        logger.info(`✅ aghanilyrics.com — ${result.provider}`);
+
+        // Sauvegarder en cache
+        try {
+          const cacheKey = `${norm(title)}|${norm(artist)}`;
+          await supabase.from('lyrics_imports').upsert({
+            cache_key: cacheKey, title, artist: artist || '',
+            lyrics: formatLyricsWithSections(cleaned, lang),
+            lang, source: 'aghanilyrics', provider: result.provider,
+            score, approved: true, status: 'completed',
+          }, { onConflict: 'cache_key' });
+        } catch {}
+
         return { lyrics: formatLyricsWithSections(cleaned, lang), lang, source: 'aghanilyrics', provider: result.provider, score, trace };
       }
     }
@@ -109,22 +194,20 @@ export async function importLyricsPipeline(title, artist) {
 }
 
 // ══════════════════════════════════════════════════════════════
-// AGHANILYRICS — URL directe artiste + match titre
+// SCRAPING AGHANILYRICS — URL directe artiste
 // ══════════════════════════════════════════════════════════════
-async function tryAghaniLyrics(title, artist) {
-  // Résoudre le slug artiste
+async function scrapeAghaniLyrics(title, artist) {
   const slug = ARAB_ARTISTS[artist?.trim()] || toSlug(artist || '');
   if (!slug || slug.length < 2) {
-    return { lyrics: null, detail: 'Artiste manquant — renseignez le compositeur en anglais ou en arabe' };
+    return { lyrics: null, detail: `Artiste "${artist}" manquant ou non reconnu — renseignez le nom en anglais dans le champ Compositeur` };
   }
 
-  // 1. Scraper la page artiste
   const artistUrl = `https://aghanilyrics.com/allsongslyrics.php?songslyrics=${slug}`;
-  logger.info(`  URL artiste: ${artistUrl}`);
+  logger.info(`  URL: ${artistUrl}`);
+
   const res = await httpGet(artistUrl);
   const $ = cheerio.load(res.data);
 
-  // Collecter tous les liens de chansons
   const songLinks = [];
   $('a[href*="songlyrics.php"]').each((_, el) => {
     const href = $(el).attr('href') || '';
@@ -134,56 +217,31 @@ async function tryAghaniLyrics(title, artist) {
     songLinks.push({ url, text });
   });
 
-  logger.info(`  ${songLinks.length} chansons trouvées pour "${slug}"`);
-  if (!songLinks.length) {
-    return { lyrics: null, detail: `Artiste "${slug}" introuvable sur aghanilyrics.com` };
-  }
+  logger.info(`  ${songLinks.length} chansons pour "${slug}"`);
+  if (!songLinks.length) return { lyrics: null, detail: `Artiste "${slug}" introuvable` };
 
-  // 2. Matcher par titre
+  // Matcher par titre
   const titleNorm = norm(title);
   const scored = songLinks.map(s => ({ ...s, score: similarity(titleNorm, norm(s.text)) }));
   scored.sort((a, b) => b.score - a.score);
   const best = scored[0];
-  logger.info(`  Meilleur match: "${best.text}" (score: ${best.score.toFixed(2)})`);
+  logger.info(`  Match: "${best.text}" — score ${best.score.toFixed(2)}`);
 
   if (best.score < 0.25) {
     return { lyrics: null, detail: `Aucune chanson proche de "${title}" — meilleur: "${best.text}" (${best.score.toFixed(2)})` };
   }
 
-  // 3. Scraper la page chanson
   const pageRes = await httpGet(best.url);
   const $$ = cheerio.load(pageRes.data);
   const lyrics = extractLyrics($$);
 
   if (!lyrics) return { lyrics: null, detail: 'Page trouvée mais paroles non extraites' };
-  return { lyrics, provider: `aghanilyrics.com (${best.text})` };
-}
-
-function extractLyrics($) {
-  for (const sel of ['.entry-content', 'article .post-content', '.post-content', 'article']) {
-    const el = $(sel).first();
-    if (!el.length) continue;
-    el.find('script, style, .sharedaddy, .jp-relatedposts, nav, iframe, .adsbygoogle, h1, h2, h3').remove();
-    el.find('br').replaceWith('\n');
-    const text = el.text().replace(/\n{3,}/g, '\n\n').trim();
-    const arabicChars = (text.match(/[\u0600-\u06FF]/g) || []).length;
-    if (arabicChars > 20 && text.length > 100) return text;
-  }
-  let best = '';
-  $('div, p').each((_, el) => {
-    const text = $(el).text().trim();
-    const arabicChars = (text.match(/[\u0600-\u06FF]/g) || []).length;
-    if (arabicChars > 30 && text.length > best.length && text.length < 10000) best = text;
-  });
-  return best.length > 100 ? best : null;
+  return { lyrics, provider: `aghanilyrics.com — ${best.text}` };
 }
 
 // ══════════════════════════════════════════════════════════════
-// RECHERCHE suggestions (inchangé)
+// RECHERCHE SUGGESTIONS
 // ══════════════════════════════════════════════════════════════
-const GENIUS_TOKEN = process.env.GENIUS_TOKEN || "flW2DO1G8O3iu_ioi0-iuIgvpnIS-vFVdYy4xUGJt-uNIwFSxx00j6zpwF0oYj3c";
-const HAPPI_KEY   = "hk1165-4Ql3s2bNtIM8v3IKHopnnFdVLUTusnsxLw";
-
 export async function searchSongs(query) {
   const results = [];
   try {
