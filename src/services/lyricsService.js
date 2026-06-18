@@ -27,6 +27,7 @@ export async function importLyricsPipeline(title, artist) {
   ];
 
   const partial = [];
+  const trace = []; // journal détaillé de chaque étape, utile pour diagnostiquer
 
   for (const step of steps) {
     try {
@@ -38,35 +39,44 @@ export async function importLyricsPipeline(title, artist) {
           const score = qualityScore(cleaned, step.name === 'scraping' ? 'scraping' : 'api');
           const lang  = detectLanguage(cleaned);
           partial.push({ lyrics: cleaned, lang, source: step.name, provider: result.provider || step.name, score });
+          trace.push({ step: step.name, status: 'partial', length: cleaned.length });
 
           if (cleaned.length > 100) {
             logger.info(`✅ Paroles trouvées via ${step.name} (${result.provider || ''})`);
-            return formatResult(partial[partial.length - 1]);
+            return formatResult(partial[partial.length - 1], trace);
           }
+        } else {
+          trace.push({ step: step.name, status: 'empty_after_clean' });
         }
+      } else {
+        trace.push({ step: step.name, status: 'no_result' });
       }
     } catch (e) {
-      logger.warn(`✗ ${step.name} échoué: ${e.message}`);
+      const status = e.response?.status;
+      trace.push({ step: step.name, status: 'error', message: e.message, httpStatus: status });
+      logger.warn(`✗ ${step.name} échoué (${status || 'no-status'}): ${e.message}`);
     }
   }
 
   if (partial.length) {
     const best = partial.sort((a, b) => b.score - a.score)[0];
     logger.info(`⚠️ Résultat partiel retenu via ${best.source}`);
-    return formatResult(best);
+    return formatResult(best, trace);
   }
 
   logger.warn(`❌ Aucune parole trouvée pour "${title}" (${artist})`);
-  return null;
+  logger.warn('Trace complète:', JSON.stringify(trace));
+  return { lyrics: null, trace }; // null lyrics mais trace renvoyée pour diagnostic
 }
 
-function formatResult({ lyrics, lang, source, provider, score }) {
+function formatResult({ lyrics, lang, source, provider, score }, trace) {
   return {
     lyrics: formatLyricsWithSections(lyrics, lang),
     lang,
     source,
     provider,
     score,
+    trace,
   };
 }
 
@@ -98,7 +108,8 @@ export async function searchSongs(query) {
 
   try {
     const res = await axios.get('https://api.happi.dev/v1/music', {
-      params: { q: query, limit: 8, apikey: HAPPI_KEY },
+      params: { q: query, limit: 8 },
+      headers: { 'x-happi-key': HAPPI_KEY },
       timeout: 8000,
     });
     (res.data.result || []).forEach(t => results.push({ title: t.track, artist: t.artist, source: 'happi', cover: null }));
@@ -131,13 +142,14 @@ export async function searchSongs(query) {
 
 async function tryHappi(title, artist) {
   const res = await axios.get('https://api.happi.dev/v1/music', {
-    params: { q: `${title} ${artist}`.trim(), limit: 1, apikey: HAPPI_KEY },
+    params: { q: `${title} ${artist}`.trim(), limit: 1 },
+    headers: { 'x-happi-key': HAPPI_KEY },
     timeout: 8000,
   });
   const track = res.data?.result?.[0];
   if (!track?.api_lyrics) return null;
 
-  const lyricsRes = await axios.get(track.api_lyrics, { params: { apikey: HAPPI_KEY }, timeout: 8000 });
+  const lyricsRes = await axios.get(track.api_lyrics, { headers: { 'x-happi-key': HAPPI_KEY }, timeout: 8000 });
   const lyrics = lyricsRes.data?.result?.lyrics;
   return lyrics ? { lyrics, provider: 'Happi.dev' } : null;
 }
@@ -179,7 +191,9 @@ async function tryDeezer(title, artist) {
   const track = searchRes.data?.data?.[0];
   if (!track?.id) return null;
 
-  let token;
+  // L'endpoint interne de Deezer nécessite de conserver les cookies de session
+  // entre la requête de jeton et la requête de paroles, sinon le serveur refuse.
+  let token, cookies;
   try {
     const tokenRes = await axios.get('https://www.deezer.com/ajax/gw-light.php', {
       params: { method: 'deezer.getUserData', input: 3, api_version: '1.0', api_token: '' },
@@ -187,6 +201,7 @@ async function tryDeezer(title, artist) {
       headers: { 'User-Agent': UA },
     });
     token = tokenRes.data?.results?.checkForm;
+    cookies = (tokenRes.headers['set-cookie'] || []).map(c => c.split(';')[0]).join('; ');
   } catch { return null; }
   if (!token) return null;
 
@@ -194,7 +209,7 @@ async function tryDeezer(title, artist) {
     const lyricsRes = await axios.get('https://www.deezer.com/ajax/gw-light.php', {
       params: { method: 'song.getLyrics', input: 3, api_version: '1.0', api_token: token, sng_id: track.id },
       timeout: 8000,
-      headers: { 'User-Agent': UA },
+      headers: { 'User-Agent': UA, Cookie: cookies },
     });
     const lyrics = lyricsRes.data?.results?.LYRICS_TEXT;
     return lyrics ? { lyrics, provider: 'Deezer' } : null;
