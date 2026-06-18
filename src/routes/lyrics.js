@@ -1,6 +1,7 @@
 // src/routes/lyrics.js
 import express from 'express';
-import { importLyricsPipeline, searchSongs, searchYouTubeUrl } from '../services/lyricsService.js';
+import { importLyricsPipeline, searchSongs, searchYouTubeUrl, scrapeGenericLyricsPage } from '../services/lyricsService.js';
+import { cleanLyrics, detectLanguage, qualityScore } from '../utils/textCleaner.js';
 import { supabase } from '../utils/supabase.js';
 import { logger } from '../utils/logger.js';
 
@@ -124,6 +125,38 @@ router.post('/:id/reject', async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /api/lyrics/import-from-url ───────────────────────────
+// Permet de coller un lien direct (Smule, ou tout site de paroles) pour en extraire le texte
+router.post('/import-from-url', async (req, res) => {
+  const { url } = req.body;
+  if (!url) return res.status(400).json({ error: 'URL requise' });
+
+  try {
+    logger.info(`Import depuis URL: ${url}`);
+    const raw = await scrapeGenericLyricsPage(url);
+    if (!raw) {
+      return res.status(404).json({ error: 'Aucune parole détectée sur cette page' });
+    }
+    const cleaned = cleanLyrics(raw);
+    if (!cleaned) {
+      return res.status(404).json({ error: 'Le texte extrait ne ressemble pas à des paroles' });
+    }
+    const lang = detectLanguage(cleaned);
+    const score = qualityScore(cleaned, 'scraping');
+
+    res.json({
+      lyrics: cleaned,
+      lang,
+      source: 'scraping',
+      provider: new URL(url).hostname.replace('www.', ''),
+      score,
+    });
+  } catch (err) {
+    logger.error('Import depuis URL échoué:', err.message);
+    res.status(500).json({ error: 'Impossible de lire cette page — vérifiez le lien' });
   }
 });
 
