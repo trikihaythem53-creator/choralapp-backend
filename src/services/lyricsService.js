@@ -50,9 +50,24 @@ export async function importLyricsPipeline(title, artist, lang = 'auto') {
     }
   }
 
+  // ── ÉTAPE 3b : aghanilyrics.com — excellent pour dialecte tunisien/maghrébin ──
+  const isArabic = /[\u0600-\u06FF]/.test(title + artist);
+  if (isArabic) {
+    logger.info('Étape 3b: aghanilyrics.com...');
+    try {
+      const aghani = await tryAghaniLyrics(title, artist);
+      if (aghani && aghani.lyrics.length > 50) {
+        const cleaned = cleanLyrics(aghani.lyrics);
+        if (cleaned) {
+          logger.info(`✅ Trouvé via aghanilyrics.com`);
+          return formatResult({ lyrics: cleaned, source: 'scraping', provider: 'aghanilyrics', score: qualityScore(cleaned, 'scraping'), lang: detectLanguage(cleaned) });
+        }
+      }
+    } catch (e) { logger.warn('aghanilyrics échoué:', e.message); }
+  }
+
   // ── ÉTAPE 4 : Scraping sites arabes ────────────────────────
   logger.info('Étape 2: Scraping...');
-  const isArabic = /[\u0600-\u06FF]/.test(title + artist);
   const sources  = isArabic ? getArabicSources(title, artist) : getFrenchSources(title, artist);
 
   for (const src of sources) {
@@ -243,7 +258,7 @@ async function tryGenericWebSearch(title, artist) {
   });
 
   // Prioriser les sites connus pour avoir des paroles (y compris Smule, lyrics tunisiens, etc.)
-  const PRIORITY_DOMAINS = ['smule.com', 'lyrics.az', 'arabiclyrics.net', 'paroles.net', 'greatsong.net', 'mawally.com', 'aghani-aghani.com'];
+  const PRIORITY_DOMAINS = ['aghanilyrics.com', 'arabiclyrics.net', 'lyrics.az', 'lyricstranslate.com', 'paroles.net', 'greatsong.net', 'mawally.com', 'smule.com'];
   const sorted = links
     .filter(l => l.startsWith('http') && !l.includes('google.com'))
     .sort((a, b) => {
@@ -293,6 +308,89 @@ export async function scrapeGenericLyricsPage(url) {
     }
   });
   return bestBlock.length > 80 ? bestBlock : null;
+}
+
+// ── aghanilyrics.com — site arabe riche en dialecte tunisien/maghrébin ─────
+// Utilise leur recherche interne (site-search.php) puis scrape la page chanson trouvée
+async function tryAghaniLyrics(title, artist) {
+  const query = `${title} ${artist}`.trim();
+  const normalize = (s) => s.toLowerCase().normalize('NFKD').replace(/[\u064B-\u065F\u0670]/g, '').trim();
+  const titleNorm = normalize(title);
+  const headers = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36' };
+
+  let candidates = [];
+
+  // Tentative 1 : leur moteur de recherche interne (paramètre incertain, on essaie plusieurs noms courants)
+  for (const param of ['q', 's', 'search', 'keyword']) {
+    try {
+      const searchUrl = `https://aghanilyrics.com/site-search.php?${param}=${encodeURIComponent(query)}`;
+      const res = await axios.get(searchUrl, { timeout: 7000, headers });
+      const $ = cheerio.load(res.data);
+      $('a[href*="songlyrics.php"]').each((_, el) => {
+        const href = $(el).attr('href');
+        const text = $(el).text().trim();
+        if (href && text) candidates.push({ href: href.startsWith('http') ? href : `https://aghanilyrics.com/${href.replace(/^\//, '')}`, text });
+      });
+      if (candidates.length) break; // un paramètre a fonctionné, pas besoin d'essayer les autres
+    } catch {}
+  }
+
+  // Tentative 2 : recherche Google ciblée sur ce seul domaine (plus fiable si leur moteur interne échoue)
+  if (!candidates.length) {
+    try {
+      const gUrl = `https://www.google.com/search?q=site:aghanilyrics.com+${encodeURIComponent(query)}`;
+      const res = await axios.get(gUrl, { timeout: 7000, headers });
+      const $ = cheerio.load(res.data);
+      $('a').each((_, el) => {
+        const href = $(el).attr('href') || '';
+        const match = href.match(/^\/url\?q=([^&]+)/);
+        if (match) {
+          const decoded = decodeURIComponent(match[1]);
+          if (decoded.includes('aghanilyrics.com/songlyrics.php')) {
+            candidates.push({ href: decoded, text: '' });
+          }
+        }
+      });
+    } catch {}
+  }
+
+  if (!candidates.length) return null;
+
+  // Choisir le résultat dont le texte du lien ressemble le plus au titre demandé
+  candidates.sort((a, b) => {
+    const aMatch = normalize(a.text).includes(titleNorm) ? 0 : 1;
+    const bMatch = normalize(b.text).includes(titleNorm) ? 0 : 1;
+    return aMatch - bMatch;
+  });
+
+  const best = candidates[0];
+  const pageRes = await axios.get(best.href, { timeout: 8000, headers });
+  const $$ = cheerio.load(pageRes.data);
+
+  // Structure observée : un <h2> avec "كلمات" suivi du texte des paroles dans le même bloc parent
+  let lyricsText = '';
+  $$('h2').each((_, el) => {
+    const heading = $$(el).text();
+    if (heading.includes('كلمات')) {
+      const container = $$(el).parent();
+      lyricsText = container.text().replace(heading, '').trim();
+    }
+  });
+
+  // Fallback : prendre le plus gros bloc de texte arabe de la page
+  if (!lyricsText || lyricsText.length < 50) {
+    let bestBlock = '';
+    $$('div, p, section').each((_, el) => {
+      const text = $$(el).text().trim();
+      const arabicChars = (text.match(/[\u0600-\u06FF]/g) || []).length;
+      if (arabicChars > 50 && text.length < 4000 && text.length > bestBlock.length) {
+        bestBlock = text;
+      }
+    });
+    lyricsText = bestBlock;
+  }
+
+  return lyricsText ? { lyrics: lyricsText } : null;
 }
 
 function getArabicSources(title, artist) {
