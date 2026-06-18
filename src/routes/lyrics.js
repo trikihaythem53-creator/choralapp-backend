@@ -1,7 +1,6 @@
 // src/routes/lyrics.js
 import express from 'express';
-import { importLyricsPipeline, searchSongs, searchYouTubeUrl, scrapeGenericLyricsPage } from '../services/lyricsService.js';
-import { cleanLyrics, detectLanguage, qualityScore } from '../utils/textCleaner.js';
+import { importLyricsPipeline, searchSongs, searchYouTubeUrl } from '../services/lyricsService.js';
 import { supabase } from '../utils/supabase.js';
 import { logger } from '../utils/logger.js';
 
@@ -22,25 +21,25 @@ router.get('/search', async (req, res) => {
 });
 
 // ── POST /api/lyrics/import ────────────────────────────────────
-// Body: { title, artist, lang }
+// Body: { title, artist }
 router.post('/import', async (req, res) => {
-  const { title, artist, lang = 'auto' } = req.body;
+  const { title, artist } = req.body;
   if (!title) return res.status(400).json({ error: 'Titre requis' });
 
   try {
     logger.info(`Import demandé: "${title}" - "${artist}"`);
-    const [result, youtubeUrl] = await Promise.all([
-      importLyricsPipeline(title, artist || '', lang),
-      searchYouTubeUrl(title, artist || ''),
-    ]);
+    const result = await importLyricsPipeline(title, artist || '');
 
     if (!result) {
+      // Aucune parole trouvée → on ne propose PAS de lien YouTube
       return res.status(404).json({
-        error: 'Paroles introuvables',
-        suggestion: 'Essayez avec le nom de l\'artiste ou via YouTube',
-        youtubeUrl,
+        error: 'Paroles introuvables sur le web',
+        suggestion: 'Essayez le mode Manuel pour saisir les paroles vous-même',
       });
     }
+
+    // Paroles trouvées → on cherche maintenant le lien YouTube en complément
+    const youtubeUrl = await searchYouTubeUrl(title, artist || '').catch(() => null);
 
     // Sauvegarder dans la table lyrics_imports pour validation admin
     const { data: saved } = await supabase.from('lyrics_imports').insert({
@@ -51,15 +50,15 @@ router.post('/import', async (req, res) => {
       source:     result.source,
       provider:   result.provider,
       score:      result.score,
-      approved:   result.score >= 0.9, // Auto-approuver si score élevé
+      approved:   result.score >= 0.9,
       status:     'completed',
     }).select().single();
 
     res.json({
       ...result,
-      id:          saved?.id,
+      id:           saved?.id,
       autoApproved: result.score >= 0.9,
-      youtubeUrl,
+      youtubeUrl,   // présent seulement car les paroles ont été trouvées
     });
   } catch (err) {
     logger.error('Import échoué:', err);
@@ -125,38 +124,6 @@ router.post('/:id/reject', async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
-  }
-});
-
-// ── POST /api/lyrics/import-from-url ───────────────────────────
-// Permet de coller un lien direct (Smule, ou tout site de paroles) pour en extraire le texte
-router.post('/import-from-url', async (req, res) => {
-  const { url } = req.body;
-  if (!url) return res.status(400).json({ error: 'URL requise' });
-
-  try {
-    logger.info(`Import depuis URL: ${url}`);
-    const raw = await scrapeGenericLyricsPage(url);
-    if (!raw) {
-      return res.status(404).json({ error: 'Aucune parole détectée sur cette page' });
-    }
-    const cleaned = cleanLyrics(raw);
-    if (!cleaned) {
-      return res.status(404).json({ error: 'Le texte extrait ne ressemble pas à des paroles' });
-    }
-    const lang = detectLanguage(cleaned);
-    const score = qualityScore(cleaned, 'scraping');
-
-    res.json({
-      lyrics: cleaned,
-      lang,
-      source: 'scraping',
-      provider: new URL(url).hostname.replace('www.', ''),
-      score,
-    });
-  } catch (err) {
-    logger.error('Import depuis URL échoué:', err.message);
-    res.status(500).json({ error: 'Impossible de lire cette page — vérifiez le lien' });
   }
 });
 
