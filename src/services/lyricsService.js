@@ -354,7 +354,7 @@ function getLatinSearchSources(title, artist) {
 
 // ── Scraping simple avec sélecteur connu (ou gestion spéciale AZLyrics) ──
 async function scrapeURL(url, selectorOrConfig) {
-  const res = await axios.get(url, { timeout: 10000, headers: { 'User-Agent': UA } });
+  const res = await fetchWithTlsFallback(url);
 
   // Cas spécial AZLyrics : les paroles sont entre commentaires HTML, pas dans une balise
   if (selectorOrConfig && typeof selectorOrConfig === 'object' && selectorOrConfig.special === 'azlyrics') {
@@ -369,6 +369,26 @@ async function scrapeURL(url, selectorOrConfig) {
   const $ = cheerio.load(res.data);
   const text = $(selectorOrConfig).first().text().trim();
   return text.length > 50 ? text : null;
+}
+
+// ── Requête HTTP avec repli automatique sur TLS ancien ──────────────────
+// Certains sites (ex: arabiclyrics.net) utilisent une configuration TLS obsolète
+// que Node.js refuse par défaut (EPROTO / unsupported protocol). On retente alors
+// avec un agent HTTPS explicitement permissif, uniquement pour ce cas précis.
+async function fetchWithTlsFallback(url) {
+  try {
+    return await axios.get(url, { timeout: 10000, headers: { 'User-Agent': UA } });
+  } catch (e) {
+    const isTlsIssue = /EPROTO|unsupported protocol|SSL routines/i.test(e.message || '');
+    if (!isTlsIssue) throw e;
+
+    const https = await import('node:https');
+    const legacyAgent = new https.Agent({
+      minVersion: 'TLSv1',
+      rejectUnauthorized: false, // certains de ces serveurs ont aussi des certificats non standards
+    });
+    return await axios.get(url, { timeout: 10000, headers: { 'User-Agent': UA }, httpsAgent: legacyAgent });
+  }
 }
 
 // ── aghanilyrics.com — riche en dialecte tunisien/maghrébin ────────────
