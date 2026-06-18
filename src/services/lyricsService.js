@@ -69,6 +69,19 @@ export async function importLyricsPipeline(title, artist, lang = 'auto') {
     } catch {}
   }
 
+  // ── ÉTAPE 5 : Recherche web générique (Google) — utile pour dialecte tunisien/maghrébin ──
+  logger.info('Étape 3: Recherche web générique...');
+  try {
+    const generic = await tryGenericWebSearch(title, artist);
+    if (generic && generic.lyrics.length > 50) {
+      const cleaned = cleanLyrics(generic.lyrics);
+      if (cleaned) {
+        logger.info(`✅ Trouvé via recherche générique (${generic.source})`);
+        return formatResult({ lyrics: cleaned, source: 'scraping', provider: generic.source, score: qualityScore(cleaned, 'scraping'), lang: detectLanguage(cleaned) });
+      }
+    }
+  } catch (e) { logger.warn('Recherche générique échouée:', e.message); }
+
   // Retourner le meilleur résultat même partiel
   const best = results.sort((a, b) => b.score - a.score)[0];
   if (best) return formatResult(best);
@@ -212,6 +225,76 @@ async function tryLyricsOvh(title, artist) {
 }
 
 // ── Sources arabes ─────────────────────────────────────────────
+// ── Recherche web générique — trouve des paroles sur n'importe quel site, y compris Smule ──
+async function tryGenericWebSearch(title, artist) {
+  const query = encodeURIComponent(`${title} ${artist} كلمات lyrics`.trim());
+  const res = await axios.get(`https://www.google.com/search?q=${query}`, {
+    timeout: 8000,
+    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36' },
+  });
+  const $ = cheerio.load(res.data);
+
+  // Extraire les liens de résultats Google
+  const links = [];
+  $('a').each((_, el) => {
+    const href = $(el).attr('href') || '';
+    const match = href.match(/^\/url\?q=([^&]+)/);
+    if (match) links.push(decodeURIComponent(match[1]));
+  });
+
+  // Prioriser les sites connus pour avoir des paroles (y compris Smule, lyrics tunisiens, etc.)
+  const PRIORITY_DOMAINS = ['smule.com', 'lyrics.az', 'arabiclyrics.net', 'paroles.net', 'greatsong.net', 'mawally.com', 'aghani-aghani.com'];
+  const sorted = links
+    .filter(l => l.startsWith('http') && !l.includes('google.com'))
+    .sort((a, b) => {
+      const aPriority = PRIORITY_DOMAINS.some(d => a.includes(d)) ? 0 : 1;
+      const bPriority = PRIORITY_DOMAINS.some(d => b.includes(d)) ? 0 : 1;
+      return aPriority - bPriority;
+    })
+    .slice(0, 5);
+
+  for (const url of sorted) {
+    try {
+      const lyrics = await scrapeGenericLyricsPage(url);
+      if (lyrics && lyrics.length > 80) {
+        return { lyrics, source: new URL(url).hostname.replace('www.', '') };
+      }
+    } catch {}
+  }
+  return null;
+}
+
+// ── Scraping générique — essaie plusieurs sélecteurs courants de pages de paroles ──
+export async function scrapeGenericLyricsPage(url) {
+  const res = await axios.get(url, {
+    timeout: 8000,
+    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36' },
+  });
+  const $ = cheerio.load(res.data);
+
+  // Sélecteurs courants utilisés par les sites de paroles (incluant structure type Smule)
+  const SELECTORS = [
+    '.lyrics', '.lyric', '.lyrics-body', '.song-text', '.lyric-body',
+    '[class*="lyric"]', '[class*="Lyric"]', '[data-lyrics]',
+    '.song-lyrics', '#lyrics', '.karaoke-lyrics', '.lrc-lyrics',
+  ];
+
+  for (const sel of SELECTORS) {
+    const text = $(sel).first().text().trim();
+    if (text && text.length > 80) return text;
+  }
+
+  // Fallback : chercher le plus gros bloc de texte avec retours à la ligne (souvent les paroles)
+  let bestBlock = '';
+  $('div, p, section').each((_, el) => {
+    const text = $(el).text().trim();
+    if (text.length > bestBlock.length && text.length < 5000 && (text.match(/\n/g) || []).length > 4) {
+      bestBlock = text;
+    }
+  });
+  return bestBlock.length > 80 ? bestBlock : null;
+}
+
 function getArabicSources(title, artist) {
   const q = encodeURIComponent(`${title} ${artist} كلمات`);
   return [
