@@ -30,11 +30,13 @@ router.post('/import', async (req, res) => {
     logger.info(`Import demandé: "${title}" - "${artist}"`);
     const result = await importLyricsPipeline(title, artist || '');
 
-    if (!result) {
+    if (!result || !result.lyrics) {
       // Aucune parole trouvée → on ne propose PAS de lien YouTube
+      // La trace détaille pourquoi chaque source a échoué (utile pour diagnostiquer)
       return res.status(404).json({
         error: 'Paroles introuvables sur le web',
         suggestion: 'Essayez le mode Manuel pour saisir les paroles vous-même',
+        trace: result?.trace || [],
       });
     }
 
