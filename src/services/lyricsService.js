@@ -19,11 +19,11 @@ export async function importLyricsPipeline(title, artist) {
   logger.info(`Pipeline lyrics: "${title}" by "${artist}"`);
 
   const steps = [
+    { name: 'scraping',   fn: tryScraping },
     { name: 'happi',      fn: tryHappi },
     { name: 'genius',     fn: tryGenius },
     { name: 'deezer',     fn: tryDeezer },
     { name: 'lyrics.ovh', fn: tryLyricsOvh },
-    { name: 'scraping',   fn: tryScraping },
   ];
 
   const partial = [];
@@ -49,7 +49,7 @@ export async function importLyricsPipeline(title, artist) {
           trace.push({ step: step.name, status: 'empty_after_clean' });
         }
       } else {
-        trace.push({ step: step.name, status: 'no_result' });
+        trace.push({ step: step.name, status: 'no_result', subTrace: result?.subTrace });
       }
     } catch (e) {
       const status = e.response?.status;
@@ -235,26 +235,47 @@ async function tryLyricsOvh(title, artist) {
 
 async function tryScraping(title, artist) {
   const isArabic = /[\u0600-\u06FF]/.test(title + artist);
+  const subTrace = [];
 
   if (isArabic) {
-    const aghani = await tryAghaniLyrics(title, artist).catch(() => null);
-    if (aghani?.lyrics) return { lyrics: aghani.lyrics, provider: 'aghanilyrics.com' };
+    try {
+      const aghani = await tryAghaniLyrics(title, artist);
+      if (aghani?.lyrics) return { lyrics: aghani.lyrics, provider: 'aghanilyrics.com', subTrace };
+      subTrace.push({ source: 'aghanilyrics.com', status: 'no_result' });
+    } catch (e) {
+      subTrace.push({ source: 'aghanilyrics.com', status: 'error', message: e.message });
+    }
 
     for (const src of getArabicSources(title, artist)) {
-      const lyrics = await scrapeURL(src.url, src.selector).catch(() => null);
-      if (lyrics) return { lyrics, provider: src.name };
+      try {
+        const lyrics = await scrapeURL(src.url, src.selector);
+        if (lyrics) return { lyrics, provider: src.name, subTrace };
+        subTrace.push({ source: src.name, status: 'no_result' });
+      } catch (e) {
+        subTrace.push({ source: src.name, status: 'error', message: e.message });
+      }
     }
   } else {
     for (const src of getLatinSources(title, artist)) {
-      const lyrics = await scrapeURL(src.url, src.selector).catch(() => null);
-      if (lyrics) return { lyrics, provider: src.name };
+      try {
+        const lyrics = await scrapeURL(src.url, src.selector);
+        if (lyrics) return { lyrics, provider: src.name, subTrace };
+        subTrace.push({ source: src.name, status: 'no_result' });
+      } catch (e) {
+        subTrace.push({ source: src.name, status: 'error', message: e.message });
+      }
     }
   }
 
-  const generic = await tryGenericWebSearch(title, artist).catch(() => null);
-  if (generic?.lyrics) return { lyrics: generic.lyrics, provider: generic.source };
+  try {
+    const generic = await tryGenericWebSearch(title, artist);
+    if (generic?.lyrics) return { lyrics: generic.lyrics, provider: generic.source, subTrace };
+    subTrace.push({ source: 'recherche générique', status: 'no_result' });
+  } catch (e) {
+    subTrace.push({ source: 'recherche générique', status: 'error', message: e.message });
+  }
 
-  return null;
+  return { lyrics: null, subTrace };
 }
 
 // ── aghanilyrics.com — riche en dialecte tunisien/maghrébin ────────────
