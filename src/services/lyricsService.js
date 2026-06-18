@@ -224,7 +224,8 @@ async function tryDeezer(title, artist) {
 
 async function tryLyricsOvh(title, artist) {
   if (!artist) return null;
-  const res = await axios.get(`https://api.lyrics.ovh/v1/${encodeURIComponent(artist)}/${encodeURIComponent(title)}`, { timeout: 8000 });
+  // lyrics.ovh est parfois lent à répondre — on lui laisse plus de marge qu'aux autres
+  const res = await axios.get(`https://api.lyrics.ovh/v1/${encodeURIComponent(artist)}/${encodeURIComponent(title)}`, { timeout: 15000 });
   const lyrics = res.data?.lyrics;
   return lyrics ? { lyrics, provider: 'Lyrics.ovh' } : null;
 }
@@ -237,6 +238,19 @@ async function tryScraping(title, artist) {
   const isArabic = /[\u0600-\u06FF]/.test(title + artist);
   const subTrace = [];
 
+  // ── 1. Sources directes (URL construite, pas de recherche — plus fiable) ──
+  const directSources = isArabic ? [] : getDirectLatinSources(title, artist);
+  for (const src of directSources) {
+    try {
+      const lyrics = await scrapeURL(src.url, src.selector);
+      if (lyrics) return { lyrics, provider: src.name, subTrace };
+      subTrace.push({ source: src.name, status: 'no_result' });
+    } catch (e) {
+      subTrace.push({ source: src.name, status: 'error', message: e.message });
+    }
+  }
+
+  // ── 2. aghanilyrics.com — riche en dialecte tunisien/maghrébin ──
   if (isArabic) {
     try {
       const aghani = await tryAghaniLyrics(title, artist);
@@ -246,7 +260,7 @@ async function tryScraping(title, artist) {
       subTrace.push({ source: 'aghanilyrics.com', status: 'error', message: e.message });
     }
 
-    for (const src of getArabicSources(title, artist)) {
+    for (const src of getArabicSearchSources(title, artist)) {
       try {
         const lyrics = await scrapeURL(src.url, src.selector);
         if (lyrics) return { lyrics, provider: src.name, subTrace };
@@ -256,7 +270,7 @@ async function tryScraping(title, artist) {
       }
     }
   } else {
-    for (const src of getLatinSources(title, artist)) {
+    for (const src of getLatinSearchSources(title, artist)) {
       try {
         const lyrics = await scrapeURL(src.url, src.selector);
         if (lyrics) return { lyrics, provider: src.name, subTrace };
@@ -267,6 +281,7 @@ async function tryScraping(title, artist) {
     }
   }
 
+  // ── 3. Dernier recours : recherche Google généraliste (souvent rate-limited) ──
   try {
     const generic = await tryGenericWebSearch(title, artist);
     if (generic?.lyrics) return { lyrics: generic.lyrics, provider: generic.source, subTrace };
@@ -276,6 +291,84 @@ async function tryScraping(title, artist) {
   }
 
   return { lyrics: null, subTrace };
+}
+
+// ── Normalisation pour construire des slugs d'URL ───────────────────────
+function slugify(str = '') {
+  return str
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')   // accents
+    .replace(/[^a-z0-9]+/g, '')        // tout sauf lettres/chiffres (pas d'espace ni tiret)
+    .trim();
+}
+function dashify(str = '') {
+  return str
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+// ── Sources directes pour l'anglais/français — URL devinée, pas de recherche ──
+// Plus fiable qu'un formulaire de recherche qui peut changer ou être protégé.
+function getDirectLatinSources(title, artist) {
+  if (!artist) return [];
+  const artistSlug = slugify(artist);
+  const titleSlug   = slugify(title);
+  const artistDash  = dashify(artist);
+  const titleDash   = dashify(title);
+
+  return [
+    {
+      name: 'azlyrics.com',
+      url: `https://www.azlyrics.com/lyrics/${artistSlug}/${titleSlug}.html`,
+      selector: null, // structure spéciale : entre commentaires HTML, gérée à part
+      special: 'azlyrics',
+    },
+    {
+      name: 'lyrics.com',
+      url: `https://www.lyrics.com/lyric/${titleDash}/${artistDash}`,
+      selector: '#lyric-body-text',
+    },
+  ];
+}
+
+// ── Sources arabes avec moteur de recherche interne ─────────────────────
+function getArabicSearchSources(title, artist) {
+  const q = encodeURIComponent(`${title} ${artist} كلمات`);
+  return [
+    { name: 'lyrics.az',        url: `https://lyrics.az/search/?q=${q}`,           selector: '.lyrics-body' },
+    { name: 'arabiclyrics.net', url: `https://www.arabiclyrics.net/search?q=${q}`, selector: '.lyric' },
+  ];
+}
+
+// ── Sources françaises/anglaises avec moteur de recherche interne ──────
+function getLatinSearchSources(title, artist) {
+  const q = encodeURIComponent(`${title} ${artist}`);
+  return [
+    { name: 'paroles.net', url: `https://www.paroles.net/recherche?q=${q}`, selector: '.song-text' },
+  ];
+}
+
+// ── Scraping simple avec sélecteur connu (ou gestion spéciale AZLyrics) ──
+async function scrapeURL(url, selectorOrConfig) {
+  const res = await axios.get(url, { timeout: 10000, headers: { 'User-Agent': UA } });
+
+  // Cas spécial AZLyrics : les paroles sont entre commentaires HTML, pas dans une balise
+  if (selectorOrConfig && typeof selectorOrConfig === 'object' && selectorOrConfig.special === 'azlyrics') {
+    const match = res.data.match(/<!-- Usage of azlyrics\.com content[^>]*-->([\s\S]*?)<\/div>/i);
+    if (match) {
+      const text = match[1].replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]+>/g, '').trim();
+      return text.length > 50 ? text : null;
+    }
+    return null;
+  }
+
+  const $ = cheerio.load(res.data);
+  const text = $(selectorOrConfig).first().text().trim();
+  return text.length > 50 ? text : null;
 }
 
 // ── aghanilyrics.com — riche en dialecte tunisien/maghrébin ────────────
@@ -347,36 +440,17 @@ async function tryAghaniLyrics(title, artist) {
   return lyricsText ? { lyrics: lyricsText } : null;
 }
 
-// ── Sources arabes classiques ───────────────────────────────────────────
-function getArabicSources(title, artist) {
-  const q = encodeURIComponent(`${title} ${artist} كلمات`);
-  return [
-    { name: 'lyrics.az',        url: `https://lyrics.az/search/?q=${q}`,           selector: '.lyrics-body' },
-    { name: 'arabiclyrics.net', url: `https://www.arabiclyrics.net/search?q=${q}`, selector: '.lyric' },
-  ];
-}
-
-// ── Sources françaises / anglaises ──────────────────────────────────────
-function getLatinSources(title, artist) {
-  const q = encodeURIComponent(`${title} ${artist}`);
-  return [
-    { name: 'paroles.net', url: `https://www.paroles.net/recherche?q=${q}`, selector: '.song-text' },
-    { name: 'greatsong',   url: `https://www.greatsong.net/paroles-${encodeURIComponent((artist||'').replace(/\s/g,'-'))}.html`, selector: '.lyric-body' },
-  ];
-}
-
-// ── Scraping simple avec sélecteur connu ────────────────────────────────
-async function scrapeURL(url, selector) {
-  const res = await axios.get(url, { timeout: 8000, headers: { 'User-Agent': UA } });
-  const $ = cheerio.load(res.data);
-  const text = $(selector).first().text().trim();
-  return text.length > 50 ? text : null;
-}
-
 // ── Recherche web générique — dernier recours, tous domaines ───────────
 async function tryGenericWebSearch(title, artist) {
   const query = encodeURIComponent(`${title} ${artist} كلمات lyrics`.trim());
-  const res = await axios.get(`https://www.google.com/search?q=${query}`, { timeout: 8000, headers: { 'User-Agent': UA } });
+  const res = await axios.get(`https://www.google.com/search?q=${query}`, {
+    timeout: 8000,
+    headers: {
+      'User-Agent': UA,
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'fr-FR,fr;q=0.9,ar;q=0.8,en;q=0.7',
+    },
+  });
   const $ = cheerio.load(res.data);
 
   const links = [];
@@ -386,7 +460,7 @@ async function tryGenericWebSearch(title, artist) {
     if (match) links.push(decodeURIComponent(match[1]));
   });
 
-  const PRIORITY_DOMAINS = ['aghanilyrics.com', 'arabiclyrics.net', 'lyrics.az', 'lyricstranslate.com', 'paroles.net', 'greatsong.net', 'azlyrics.com', 'genius.com'];
+  const PRIORITY_DOMAINS = ['aghanilyrics.com', 'arabiclyrics.net', 'lyrics.az', 'lyricstranslate.com', 'paroles.net', 'genius.com'];
   const sorted = links
     .filter(l => l.startsWith('http') && !l.includes('google.com'))
     .sort((a, b) => {
