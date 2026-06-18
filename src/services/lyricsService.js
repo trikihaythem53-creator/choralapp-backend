@@ -227,8 +227,11 @@ async function scrapeAghaniLyrics(title, artist) {
   const best = scored[0];
   logger.info(`  Match: "${best.text}" — score ${best.score.toFixed(2)}`);
 
-  if (best.score < 0.25) {
-    return { lyrics: null, detail: `Aucune chanson proche de "${title}" — meilleur: "${best.text}" (${best.score.toFixed(2)})` };
+  const top3 = scored.slice(0, 3).map(s => `"${s.text}" (${s.score.toFixed(2)})`).join(', ');
+  logger.info(`  Top 3: ${top3}`);
+
+  if (best.score < 0.15) {
+    return { lyrics: null, detail: `Score trop faible — top 3: ${top3}` };
   }
 
   const pageRes = await httpGet(best.url);
